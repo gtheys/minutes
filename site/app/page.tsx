@@ -304,13 +304,11 @@ export default function Home() {
         </p>
 
         <p className="mx-auto mt-4 max-w-[620px] text-[14px] leading-6 text-[var(--text-secondary)]">
-          v{MINUTES_RELEASE_VERSION} adds Agent Event Bus v0 for local
-          workflow automation, a SQLite FTS5 index for faster archive search,
-          safer call-aware recording starts, isolated queued processing so
-          long jobs do not freeze the desktop app, prompt-only templates, and
-          the new lowercase
-          <span className="mx-1 font-serif italic text-[var(--text)]">m</span>
-          identity across the app, tray, DMG, site, and MCP surfaces.
+          v{MINUTES_RELEASE_VERSION} fixes the stale processing-recovery loop:
+          dismissed failed-capture notices now stay dismissed after restart,
+          while retry still clears the dismissal marker for a fresh attempt.
+          It also carries forward the active-recording status polling fix that
+          keeps desktop calls from piling up while audio capture is running.
         </p>
 
         <div className="mt-12">
