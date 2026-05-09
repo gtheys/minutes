@@ -2714,6 +2714,328 @@ mod tests {
         );
     }
 
+    /// SPIKE — does whisper-rs's Silero VAD carry LSTM state across
+    /// `detect_speech` calls? If yes, Option A in PLAN-vad-refactor.md is
+    /// viable: feed only new-since-last-call samples per chunk, accumulate
+    /// probabilities externally. If no, the per-chunk re-scan is structural
+    /// and Option B (independent ort-backed Silero) is required.
+    ///
+    /// Run with: `cargo test -p minutes-core --features whisper --lib
+    ///   live_transcript::tests::option_a_spike -- --ignored --nocapture`
+    ///
+    /// Requires `~/.minutes/models/ggml-silero-v6.2.0.bin` to exist (i.e.
+    /// `minutes setup` has run on this machine). Output is informational
+    /// only; the test only fails if the model is unloadable.
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    #[ignore]
+    fn option_a_spike_silero_state_carries_across_detect_speech_calls() {
+        use std::path::PathBuf;
+
+        let model_path = dirs::home_dir()
+            .unwrap()
+            .join(".minutes/models/ggml-silero-v6.2.0.bin");
+        if !model_path.exists() {
+            eprintln!(
+                "[spike] no Silero model at {} — run `minutes setup` first",
+                model_path.display()
+            );
+            return;
+        }
+
+        // Build deterministic test signal: 1s silence + 1s 440Hz tone +
+        // 1s silence, 16kHz f32 normalized to ~0.5 amplitude in the tone
+        // region. Total 48,000 samples = 3s.
+        let mut samples = Vec::with_capacity(48_000);
+        samples.extend(std::iter::repeat_n(0.0_f32, 16_000));
+        for i in 0..16_000 {
+            let t = i as f32 / 16_000.0;
+            samples.push((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5);
+        }
+        samples.extend(std::iter::repeat_n(0.0_f32, 16_000));
+
+        let mid = samples.len() / 2;
+
+        let make_ctx = || -> whisper_rs::WhisperVadContext {
+            let mut params = whisper_rs::WhisperVadContextParams::default();
+            params.set_n_threads(2);
+            whisper_rs::WhisperVadContext::new(model_path.to_str().expect("utf-8 path"), params)
+                .expect("Silero model load")
+        };
+
+        // Mode A: single full-buffer call.
+        let mut ctx_a = make_ctx();
+        ctx_a.detect_speech(&samples).expect("detect_speech full");
+        let probs_full = ctx_a.probabilities().to_vec();
+
+        // Mode B: two halves, fresh context.
+        let mut ctx_b = make_ctx();
+        ctx_b
+            .detect_speech(&samples[..mid])
+            .expect("detect_speech first half");
+        let probs_first_half = ctx_b.probabilities().to_vec();
+        ctx_b
+            .detect_speech(&samples[mid..])
+            .expect("detect_speech second half");
+        let probs_second_half = ctx_b.probabilities().to_vec();
+
+        let probs_concat: Vec<f32> = probs_first_half
+            .iter()
+            .copied()
+            .chain(probs_second_half.iter().copied())
+            .collect();
+
+        eprintln!("[spike] full samples: {}", samples.len());
+        eprintln!(
+            "[spike] mode A (single call) probs.len(): {}",
+            probs_full.len()
+        );
+        eprintln!(
+            "[spike] mode B (two halves) probs.len(): first={} second={} concat={}",
+            probs_first_half.len(),
+            probs_second_half.len(),
+            probs_concat.len()
+        );
+
+        // Length parity: do we get the same total probability count from
+        // both modes? If second_half's probabilities are computed as if the
+        // input were standalone (no carried context), the count should
+        // match a fresh call on samples[mid..].
+        if probs_full.len() != probs_concat.len() {
+            eprintln!(
+                "[spike] LENGTH MISMATCH (Mode A: {}, Mode B: {}) — \
+                 second detect_speech call produces output as if input were \
+                 standalone; LSTM state likely RESETS per call",
+                probs_full.len(),
+                probs_concat.len()
+            );
+        }
+
+        // Diff stats over the overlapping prefix.
+        let n = probs_full.len().min(probs_concat.len());
+        if n > 0 {
+            let diffs: Vec<f32> = (0..n)
+                .map(|i| (probs_full[i] - probs_concat[i]).abs())
+                .collect();
+            let max_diff = diffs.iter().fold(0.0_f32, |a, &b| a.max(b));
+            let mean_diff = diffs.iter().sum::<f32>() / diffs.len() as f32;
+            let above_5pct = diffs.iter().filter(|&&d| d > 0.05).count();
+            eprintln!(
+                "[spike] prefix diff stats over {} samples: max={:.4}, mean={:.4}, count_above_0.05={}",
+                n, max_diff, mean_diff, above_5pct
+            );
+            // Verdict guidance.
+            if max_diff < 0.01 {
+                eprintln!(
+                    "[spike] VERDICT: probabilities match within tolerance — \
+                     OPTION A LIKELY VIABLE. Incremental detect_speech \
+                     accumulates probabilities consistent with single call."
+                );
+            } else if max_diff < 0.1 {
+                eprintln!(
+                    "[spike] VERDICT: small drift (max diff {:.4}) — Option A \
+                     might work with retuned thresholds; investigate boundary \
+                     behavior more carefully before committing.",
+                    max_diff
+                );
+            } else {
+                eprintln!(
+                    "[spike] VERDICT: significant drift (max diff {:.4}) — \
+                     OPTION A NOT VIABLE. detect_speech does not preserve \
+                     LSTM state across calls. Option B (ort-backed Silero) \
+                     required.",
+                    max_diff
+                );
+            }
+        }
+
+        // The test always passes; output is informational. Failing here
+        // would just block the spike from running.
+        let _ = PathBuf::from(model_path);
+    }
+
+    /// SPIKE v2 — richer probe on real speech, simulating the production
+    /// 100ms-chunk cadence to see if incremental detect_speech calls
+    /// produce probabilities consistent enough with a single full-buffer
+    /// call that threshold-based speech detection lands in the same
+    /// places.
+    ///
+    /// Method:
+    /// 1. Load `crates/assets/demo.wav` (~10.6s of real speech) into
+    ///    16kHz f32 samples.
+    /// 2. Mode A: single detect_speech call over the whole buffer,
+    ///    record probabilities.
+    /// 3. Mode B: feed in 1600-sample (100ms) chunks, record each
+    ///    call's probabilities, concatenate.
+    /// 4. Apply binary threshold at 0.2 to both probability vectors
+    ///    and count windows where the speech/no-speech decision
+    ///    DIFFERS between modes. Each diff is a potential
+    ///    misdetection if Option A shipped.
+    ///
+    /// Verdict bar (per codex parity definition):
+    /// - 0 flips: Option A safe.
+    /// - 1-3 isolated flips at speech boundaries: probably fine,
+    ///   boundary drift up to ±150ms is acceptable.
+    /// - Many flips OR flips inside contiguous speech regions:
+    ///   Option A unsafe; Option B required.
+    ///
+    /// Run with: `cargo test -p minutes-core --features
+    /// "whisper streaming" --lib option_a_spike_v2 -- --ignored
+    /// --nocapture`
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    #[ignore]
+    fn option_a_spike_v2_real_speech_threshold_decisions() {
+        let model_path = dirs::home_dir()
+            .unwrap()
+            .join(".minutes/models/ggml-silero-v6.2.0.bin");
+        if !model_path.exists() {
+            eprintln!(
+                "[spike v2] no Silero model at {} — run `minutes setup`",
+                model_path.display()
+            );
+            return;
+        }
+
+        // Find the demo WAV. Workspace root is two levels up from this
+        // crate; the assets crate sits next to ours.
+        let cargo_manifest = env!("CARGO_MANIFEST_DIR");
+        let demo_wav = std::path::PathBuf::from(cargo_manifest)
+            .parent()
+            .expect("crate parent")
+            .join("assets/demo.wav");
+        if !demo_wav.exists() {
+            eprintln!("[spike v2] no demo.wav at {}", demo_wav.display());
+            return;
+        }
+
+        let samples = read_wav_samples(&demo_wav);
+        eprintln!(
+            "[spike v2] loaded {} samples ({:.1}s at 16kHz)",
+            samples.len(),
+            samples.len() as f32 / 16_000.0
+        );
+
+        let make_ctx = || -> whisper_rs::WhisperVadContext {
+            let mut params = whisper_rs::WhisperVadContextParams::default();
+            params.set_n_threads(2);
+            whisper_rs::WhisperVadContext::new(model_path.to_str().expect("utf-8 path"), params)
+                .expect("Silero load")
+        };
+
+        // Mode A: single full-buffer call.
+        let mut ctx_a = make_ctx();
+        ctx_a.detect_speech(&samples).expect("detect_speech full");
+        let probs_a = ctx_a.probabilities().to_vec();
+
+        // Mode B: 100ms chunks, fresh context, append per-call probs.
+        let chunk_size = 1600; // 100ms at 16kHz
+        let mut ctx_b = make_ctx();
+        let mut probs_b: Vec<f32> = Vec::new();
+        for chunk in samples.chunks(chunk_size) {
+            ctx_b.detect_speech(chunk).expect("detect_speech chunk");
+            probs_b.extend_from_slice(ctx_b.probabilities());
+        }
+
+        eprintln!(
+            "[spike v2] Mode A probs.len: {} | Mode B probs.len: {}",
+            probs_a.len(),
+            probs_b.len()
+        );
+
+        // Align lengths for comparison. Mode B may have slightly more
+        // probability windows because each chunk's detect_speech rounds up.
+        let n = probs_a.len().min(probs_b.len());
+
+        // Apply the production threshold.
+        const THRESHOLD: f32 = 0.2; // matches SIDECAR_VAD_THRESHOLD
+        let mut flips = 0usize;
+        let mut flip_a_speech_b_silence = 0usize;
+        let mut flip_a_silence_b_speech = 0usize;
+        let mut max_diff = 0.0_f32;
+        let mut sum_diff = 0.0_f32;
+        let mut consecutive_flips = 0usize;
+        let mut max_consecutive = 0usize;
+
+        for i in 0..n {
+            let a_speech = probs_a[i] >= THRESHOLD;
+            let b_speech = probs_b[i] >= THRESHOLD;
+            let diff = (probs_a[i] - probs_b[i]).abs();
+            max_diff = max_diff.max(diff);
+            sum_diff += diff;
+
+            if a_speech != b_speech {
+                flips += 1;
+                consecutive_flips += 1;
+                max_consecutive = max_consecutive.max(consecutive_flips);
+                if a_speech {
+                    flip_a_speech_b_silence += 1;
+                } else {
+                    flip_a_silence_b_speech += 1;
+                }
+            } else {
+                consecutive_flips = 0;
+            }
+        }
+
+        let mean_diff = if n > 0 { sum_diff / n as f32 } else { 0.0 };
+
+        eprintln!(
+            "[spike v2] over {} comparable windows ({:.1}s of audio):",
+            n,
+            n as f32 * 32.0 / 16_000.0 // each prob window represents ~32ms
+        );
+        eprintln!("[spike v2]   max prob diff:  {:.4}", max_diff);
+        eprintln!("[spike v2]   mean prob diff: {:.4}", mean_diff);
+        eprintln!(
+            "[spike v2]   threshold flips: {} total (A=speech/B=silence: {}, A=silence/B=speech: {})",
+            flips, flip_a_speech_b_silence, flip_a_silence_b_speech
+        );
+        eprintln!(
+            "[spike v2]   longest flip run: {} windows ({:.0}ms)",
+            max_consecutive,
+            max_consecutive as f32 * 32.0
+        );
+
+        // Verdict.
+        let flip_pct = if n > 0 {
+            (flips as f32 / n as f32) * 100.0
+        } else {
+            0.0
+        };
+
+        if flips == 0 {
+            eprintln!(
+                "[spike v2] VERDICT: zero threshold flips — OPTION A SAFE. \
+                 Incremental detect_speech produces threshold decisions \
+                 identical to the full-buffer call on real speech."
+            );
+        } else if max_consecutive <= 5 && flip_pct < 5.0 {
+            eprintln!(
+                "[spike v2] VERDICT: {} isolated flips ({:.1}%, longest run {} \
+                 windows = {:.0}ms). Within codex's ±150ms boundary tolerance. \
+                 OPTION A LIKELY SAFE for production. Validate with one more \
+                 dogfood session before defaulting.",
+                flips,
+                flip_pct,
+                max_consecutive,
+                max_consecutive as f32 * 32.0
+            );
+        } else {
+            eprintln!(
+                "[spike v2] VERDICT: {} flips ({:.1}%, longest run {} windows \
+                 = {:.0}ms). Exceeds parity tolerance. OPTION A UNSAFE — \
+                 incremental probabilities diverge in ways that flip speech \
+                 detection. Option B (ort-backed Silero with persistent LSTM \
+                 state) is required.",
+                flips,
+                flip_pct,
+                max_consecutive,
+                max_consecutive as f32 * 32.0
+            );
+        }
+    }
+
     #[cfg(all(feature = "whisper", feature = "streaming"))]
     #[test]
     fn sidecar_missing_status_is_inactive_with_diagnostic() {
