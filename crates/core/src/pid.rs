@@ -567,9 +567,34 @@ pub struct RecordingStatus {
     pub wav_path: Option<String>,
 }
 
-/// Get current recording status.
+/// Get current recording status. Convenience wrapper that fetches its own
+/// active-jobs snapshot. Hot-path callers that already have the snapshot
+/// should call [`status_with_active_jobs`] instead — each `active_jobs()`
+/// call walks `~/.minutes/jobs/` from disk, and a single status build
+/// otherwise scans the dir up to three times.
 pub fn status() -> RecordingStatus {
-    let jobs_summary = crate::jobs::processing_summary();
+    let active_jobs = crate::jobs::active_jobs();
+    status_with_active_jobs(&active_jobs)
+}
+
+/// Build a `RecordingStatus` from a pre-fetched `active_jobs` snapshot.
+///
+/// `status_value` in the Tauri commands layer polls at 1 Hz during a
+/// recording. Each invocation needs to see the current set of in-flight
+/// jobs once for its own JSON payload, and historically also passed
+/// through `status()` which fetched the same set twice more (via
+/// `processing_summary` and `active_job_count`). Threading the snapshot
+/// through collapses three full directory walks into one — the user's
+/// jobs/ directory grows without bound as meetings accumulate, so this
+/// is meaningful for power users with hundreds of past meetings.
+///
+/// Ordering precondition: `active_jobs` must be in the order produced by
+/// [`crate::jobs::active_jobs`] — active < queued < terminal, then
+/// `created_at` descending. The first element is taken as the in-flight
+/// summary; an unsorted slice will surface the wrong job.
+pub fn status_with_active_jobs(active_jobs: &[crate::jobs::ProcessingJob]) -> RecordingStatus {
+    let jobs_summary = active_jobs.first().cloned();
+    let job_count = active_jobs.len();
     let processing = jobs_summary
         .as_ref()
         .map(|job| ProcessingStatus {
@@ -582,7 +607,7 @@ pub fn status() -> RecordingStatus {
                 .clone()
                 .or_else(|| job.output_path.as_ref().map(|path| path.to_string())),
             job_id: Some(job.id.clone()),
-            job_count: crate::jobs::active_job_count(),
+            job_count,
         })
         .unwrap_or_else(read_processing_status);
     match check_recording() {
@@ -675,6 +700,98 @@ mod tests {
         let metadata = read_recording_metadata().unwrap();
         assert_eq!(metadata.mode, CaptureMode::QuickThought);
         clear_recording_metadata().unwrap();
+    }
+
+    #[test]
+    fn status_with_active_jobs_uses_slice_as_source_of_truth() {
+        // Locks in the perf-fix contract: status_with_active_jobs reads job
+        // count and summary fields off the passed-in slice instead of going
+        // back to disk. Important — this is what removes 2 of the 3 directory
+        // walks per UI status poll.
+        let _guard = crate::test_home_env_lock();
+        let job = crate::jobs::ProcessingJob {
+            id: "job-status-check".into(),
+            mode: CaptureMode::Meeting,
+            content_type: crate::markdown::ContentType::Meeting,
+            title: Some("Status check job".into()),
+            audio_path: "/tmp/status.wav".into(),
+            output_path: None,
+            state: crate::jobs::JobState::Transcribing,
+            stage: Some("Transcribing meeting".into()),
+            created_at: chrono::Local::now(),
+            started_at: Some(chrono::Local::now()),
+            finished_at: None,
+            notice_dismissed_at: None,
+            recording_started_at: None,
+            recording_finished_at: None,
+            context_session_id: None,
+            user_notes: None,
+            pre_context: None,
+            calendar_event: None,
+            template_slug: None,
+            recording_health: None,
+            word_count: None,
+            error: None,
+            owner_pid: Some(4242),
+        };
+        let jobs = vec![job];
+        let status = status_with_active_jobs(&jobs);
+        assert!(status.processing);
+        assert_eq!(
+            status.processing_job_id.as_deref(),
+            Some("job-status-check")
+        );
+        assert_eq!(status.processing_job_count, 1);
+        assert_eq!(status.processing_title.as_deref(), Some("Status check job"));
+        assert_eq!(
+            status.processing_stage.as_deref(),
+            Some("Transcribing meeting")
+        );
+
+        let empty: Vec<crate::jobs::ProcessingJob> = Vec::new();
+        let empty_status = status_with_active_jobs(&empty);
+        assert_eq!(empty_status.processing_job_count, 0);
+        assert_eq!(empty_status.processing_job_id, None);
+    }
+
+    #[test]
+    fn status_with_active_jobs_takes_first_element_as_summary() {
+        // Locks in that the function trusts caller-provided ordering.
+        // active_jobs() returns active < queued < terminal then created_at
+        // desc; the active in-flight job must surface as the summary.
+        let _guard = crate::test_home_env_lock();
+        let mk = |id: &str, state: crate::jobs::JobState, title: &str| crate::jobs::ProcessingJob {
+            id: id.into(),
+            mode: CaptureMode::Meeting,
+            content_type: crate::markdown::ContentType::Meeting,
+            title: Some(title.into()),
+            audio_path: format!("/tmp/{id}.wav"),
+            output_path: None,
+            state,
+            stage: state.default_stage(),
+            created_at: chrono::Local::now(),
+            started_at: None,
+            finished_at: None,
+            notice_dismissed_at: None,
+            recording_started_at: None,
+            recording_finished_at: None,
+            context_session_id: None,
+            user_notes: None,
+            pre_context: None,
+            calendar_event: None,
+            template_slug: None,
+            recording_health: None,
+            word_count: None,
+            error: None,
+            owner_pid: None,
+        };
+        let active = mk("job-a", crate::jobs::JobState::Transcribing, "Active job");
+        let queued = mk("job-q", crate::jobs::JobState::Queued, "Queued job");
+        let jobs = vec![active, queued];
+        let status = status_with_active_jobs(&jobs);
+        assert_eq!(status.processing_job_id.as_deref(), Some("job-a"));
+        assert_eq!(status.processing_title.as_deref(), Some("Active job"));
+        assert_eq!(status.processing_job_count, 2);
     }
 
     #[test]

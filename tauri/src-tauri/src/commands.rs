@@ -5035,6 +5035,10 @@ pub fn cmd_mic_mute_state() -> bool {
 fn status_value(state: &AppState, include_readiness: bool) -> serde_json::Value {
     let recording = state.recording.load(Ordering::Relaxed);
     let shared_processing = minutes_core::pid::read_processing_status();
+    // Scan ~/.minutes/jobs/ once per status call — `pid::status_with_active_jobs`
+    // reuses this snapshot instead of triggering two more directory walks
+    // (processing_summary + active_job_count) inside pid::status. This
+    // matters at 1 Hz UI poll cadence when terminal jobs accumulate.
     let active_jobs = minutes_core::jobs::active_jobs();
     if active_jobs.is_empty() && !shared_processing.processing {
         state.processing.store(false, Ordering::Relaxed);
@@ -5043,7 +5047,7 @@ fn status_value(state: &AppState, include_readiness: bool) -> serde_json::Value 
     let processing = state.processing.load(Ordering::Relaxed)
         || shared_processing.processing
         || !active_jobs.is_empty();
-    let status = minutes_core::pid::status();
+    let status = minutes_core::pid::status_with_active_jobs(&active_jobs);
     let local_processing_stage = state
         .processing_stage
         .lock()
