@@ -81,7 +81,7 @@ pub use template::{Template, TemplateResolver, TemplateSource, DEFAULT_TEMPLATE_
 #[cfg(feature = "streaming")]
 pub use streaming::{AudioChunk, AudioStream};
 #[cfg(feature = "streaming")]
-pub use vad::{Vad, VadResult};
+pub use vad::{Vad, VadEngine, VadResult};
 
 /// Route whisper.cpp + ggml C-level logs through the Rust `tracing`
 /// subscriber instead of leaking to raw stderr. Without this hook the C
