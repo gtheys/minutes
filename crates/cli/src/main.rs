@@ -399,6 +399,28 @@ enum Commands {
         json: bool,
     },
 
+    /// Show raw-audio storage and retention policy
+    Storage {
+        /// Output raw JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Preview or apply raw-audio cleanup
+    Cleanup {
+        /// Delete cleanup candidates. Without this flag, cleanup is preview-only.
+        #[arg(long)]
+        apply: bool,
+
+        /// Override successful-audio retention window for this run (for example: 14d, 30d)
+        #[arg(long, value_name = "DURATION")]
+        older_than: Option<String>,
+
+        /// Output raw JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Search meeting transcripts and voice memos
     Search {
         /// Text to search for
@@ -1383,6 +1405,12 @@ fn main() -> Result<()> {
         Commands::Status => cmd_status(),
         Commands::Jobs { all, json, limit } => cmd_jobs(all, json, limit),
         Commands::Paths { json } => cmd_paths(json, &config),
+        Commands::Storage { json } => cmd_storage(json, &config),
+        Commands::Cleanup {
+            apply,
+            older_than,
+            json,
+        } => cmd_cleanup(apply, older_than.as_deref(), json, &config),
         Commands::Autoresearch { action } => match action {
             AutoresearchAction::Run {
                 corpus,
@@ -2623,6 +2651,140 @@ fn cmd_paths(json: bool, config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Serialize)]
+struct CleanupError {
+    path: PathBuf,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct CleanupReport {
+    plan: minutes_core::retention::RetentionPlan,
+    applied: bool,
+    removed: Vec<PathBuf>,
+    errors: Vec<CleanupError>,
+}
+
+fn cmd_storage(json: bool, config: &Config) -> Result<()> {
+    let plan = minutes_core::retention::preview_audio_retention(config, Local::now());
+    if json {
+        let envelope = json_envelope("minutes storage", plan);
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
+    } else {
+        print_storage_summary(&plan, config);
+    }
+    Ok(())
+}
+
+fn cmd_cleanup(apply: bool, older_than: Option<&str>, json: bool, config: &Config) -> Result<()> {
+    let mut effective_config = config.clone();
+    if let Some(value) = older_than {
+        effective_config.retention.successful_audio_days = parse_retention_days(value)?;
+    }
+
+    let plan = minutes_core::retention::preview_audio_retention(&effective_config, Local::now());
+    let mut report = CleanupReport {
+        plan,
+        applied: apply,
+        removed: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    if apply {
+        for item in
+            report.plan.items.iter().filter(|item| {
+                item.action == minutes_core::retention::RetentionAction::DeleteCandidate
+            })
+        {
+            match std::fs::remove_file(&item.path) {
+                Ok(()) => report.removed.push(item.path.clone()),
+                Err(error) => report.errors.push(CleanupError {
+                    path: item.path.clone(),
+                    error: error.to_string(),
+                }),
+            }
+        }
+    }
+
+    if json {
+        let envelope = json_envelope("minutes cleanup", report);
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
+    } else {
+        print_cleanup_summary(&report, &effective_config);
+    }
+    Ok(())
+}
+
+fn print_storage_summary(plan: &minutes_core::retention::RetentionPlan, config: &Config) {
+    println!("Minutes storage");
+    println!("  output_dir: {}", plan.output_dir.display());
+    println!(
+        "  raw audio: {} across {} file(s)",
+        format_bytes(plan.totals.raw_audio_bytes),
+        plan.totals.raw_audio_files
+    );
+    println!(
+        "  cleanup candidates: {} across {} file(s)",
+        format_bytes(plan.totals.delete_candidate_bytes),
+        plan.totals.delete_candidate_files
+    );
+    println!(
+        "  policy: successful audio {}d, failed/needs-review audio {}d, pinned audio kept",
+        config.retention.successful_audio_days, config.retention.failed_audio_days
+    );
+}
+
+fn print_cleanup_summary(report: &CleanupReport, config: &Config) {
+    if report.applied {
+        println!("Minutes cleanup applied");
+        println!("  removed: {} file(s)", report.removed.len());
+        if !report.errors.is_empty() {
+            println!("  errors: {} file(s)", report.errors.len());
+        }
+    } else {
+        println!("Minutes cleanup preview");
+        println!("  no files deleted; pass --apply to remove candidates");
+    }
+    println!(
+        "  candidates: {} across {} file(s)",
+        format_bytes(report.plan.totals.delete_candidate_bytes),
+        report.plan.totals.delete_candidate_files
+    );
+    println!(
+        "  policy: successful audio {}d, failed/needs-review audio {}d",
+        config.retention.successful_audio_days, config.retention.failed_audio_days
+    );
+}
+
+fn parse_retention_days(value: &str) -> Result<u32> {
+    let trimmed = value.trim().to_ascii_lowercase();
+    let digits = trimmed
+        .strip_suffix("days")
+        .or_else(|| trimmed.strip_suffix("day"))
+        .or_else(|| trimmed.strip_suffix('d'))
+        .unwrap_or(&trimmed)
+        .trim();
+    let days = digits
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("invalid duration '{}'; use values like 14d or 30d", value))?;
+    Ok(days)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{:.1} {}", value, UNITS[unit])
+    }
 }
 
 fn owner_display(
@@ -6502,6 +6664,53 @@ life (qmd://life/)
                 !meetings.join("archive/2026-04-01-force.md").exists(),
                 "nothing in archive for force delete"
             );
+        });
+    }
+
+    #[test]
+    fn parse_retention_days_accepts_day_suffixes() {
+        assert_eq!(parse_retention_days("30").unwrap(), 30);
+        assert_eq!(parse_retention_days("14d").unwrap(), 14);
+        assert_eq!(parse_retention_days("7 days").unwrap(), 7);
+    }
+
+    #[test]
+    fn cmd_cleanup_apply_removes_only_expired_audio_candidates() {
+        with_temp_home(|dir| {
+            let meetings = dir.join("meetings");
+            std::fs::create_dir_all(&meetings).unwrap();
+            let old_md = meetings.join("old.md");
+            std::fs::write(
+                &old_md,
+                "---\ntitle: Old\ntype: meeting\ndate: 2026-04-01T09:00:00-07:00\nduration: 5m\n---\n\nOld",
+            )
+            .unwrap();
+            let old_wav = meetings.join("old.wav");
+            std::fs::write(&old_wav, b"old audio").unwrap();
+
+            let pinned_md = meetings.join("pinned.md");
+            std::fs::write(
+                &pinned_md,
+                "---\ntitle: Pinned\ntype: meeting\ndate: 2026-04-01T09:00:00-07:00\nduration: 5m\naudio_retention: pinned\n---\n\nPinned",
+            )
+            .unwrap();
+            let pinned_wav = meetings.join("pinned.wav");
+            std::fs::write(&pinned_wav, b"pinned audio").unwrap();
+
+            let config = Config {
+                output_dir: meetings.clone(),
+                ..Config::default()
+            };
+
+            cmd_cleanup(true, Some("0d"), true, &config).unwrap();
+
+            assert!(old_md.exists(), "cleanup must not delete markdown");
+            assert!(
+                !old_wav.exists(),
+                "expired unpinned audio should be removed"
+            );
+            assert!(pinned_md.exists(), "pinned markdown remains");
+            assert!(pinned_wav.exists(), "pinned audio should be kept");
         });
     }
 

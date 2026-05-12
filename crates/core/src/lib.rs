@@ -28,6 +28,7 @@ pub mod parakeet_sidecar;
 pub(crate) mod person_identity;
 pub mod pid;
 pub mod pipeline;
+pub mod retention;
 // Shared mono-downmix + decimation resampler (used by capture and streaming)
 pub(crate) mod resample;
 pub mod screen;

@@ -119,6 +119,24 @@ When `capture_backend = "core-audio-tap"`, set `call = "auto"`. The backend
 captures the default macOS system output via Core Audio Process Tap instead of
 opening a named loopback input device.
 
+### `[retention]` — raw audio policy
+
+Minutes treats markdown transcripts, summaries, graph/search data, and metadata
+as the durable library. Raw audio is a short-lived recovery/reprocessing layer
+unless pinned.
+
+| key | default | meaning |
+|---|---|---|
+| `successful_audio_days` | `30` | Days to keep raw audio for successfully processed recordings |
+| `failed_audio_days` | `90` | Days to keep raw audio for failed or needs-review recordings |
+| `keep_pinned_audio` | `true` | Keep audio when meeting frontmatter has `audio_retention: pinned` |
+| `auto_cleanup` | `false` | Reserved for future automatic cleanup runners; current CLI cleanup requires explicit `--apply` |
+| `cleanup_on_startup` | `false` | Reserved for future startup cleanup |
+| `warn_above_gb` | `2` | Threshold for surfacing raw-audio storage warnings |
+
+Inspect storage with `minutes storage`. Preview cleanup with `minutes cleanup`;
+delete candidates only with the explicit `minutes cleanup --apply`.
+
 ### `[identity]` — who you are (for attribution)
 
 | key | default | meaning |

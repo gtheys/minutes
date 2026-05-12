@@ -36,6 +36,7 @@ pub struct Config {
     pub voice: VoiceConfig,
     pub live_transcript: LiveTranscriptConfig,
     pub recording: RecordingConfig,
+    pub retention: RetentionConfig,
     pub hooks: HooksConfig,
     pub knowledge: KnowledgeConfig,
     pub palette: PaletteConfig,
@@ -301,6 +302,31 @@ pub struct PrivacyConfig {
     pub hide_from_screen_share: bool,
 }
 
+/// Retention policy for raw audio artifacts.
+///
+/// Product stance: markdown transcripts and structured memory are the durable
+/// library. Raw audio is a temporary recovery/reprocessing layer unless a user
+/// explicitly pins it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetentionConfig {
+    /// Keep successful recording audio for this many days by default.
+    pub successful_audio_days: u32,
+    /// Keep failed/needs-review audio longer so the user can recover it.
+    pub failed_audio_days: u32,
+    /// Honor `audio_retention: pinned` in meeting frontmatter.
+    pub keep_pinned_audio: bool,
+    /// Whether future cleanup runners may apply the policy automatically.
+    ///
+    /// The current implementation only previews cleanup candidates; destructive
+    /// apply paths must opt in explicitly.
+    pub auto_cleanup: bool,
+    /// Whether startup is allowed to trigger automatic cleanup.
+    pub cleanup_on_startup: bool,
+    /// Surface a storage warning when raw audio exceeds this many GiB.
+    pub warn_above_gb: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AssistantConfig {
@@ -324,6 +350,19 @@ impl Default for PrivacyConfig {
     fn default() -> Self {
         Self {
             hide_from_screen_share: true,
+        }
+    }
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            successful_audio_days: 30,
+            failed_audio_days: 90,
+            keep_pinned_audio: true,
+            auto_cleanup: false,
+            cleanup_on_startup: false,
+            warn_above_gb: 2,
         }
     }
 }
@@ -727,6 +766,7 @@ impl Default for Config {
             voice: VoiceConfig::default(),
             live_transcript: LiveTranscriptConfig::default(),
             recording: RecordingConfig::default(),
+            retention: RetentionConfig::default(),
             hooks: HooksConfig::default(),
             knowledge: KnowledgeConfig::default(),
             palette: PaletteConfig::default(),
