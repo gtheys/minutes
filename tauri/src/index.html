@@ -6043,6 +6043,37 @@
       }
     }
 
+    function primaryProcessingJob(status) {
+      const jobs = Array.isArray(status?.processingJobs) ? status.processingJobs : [];
+      return jobs[0] || null;
+    }
+
+    function processingStageText(job, fallbackStage) {
+      if (job?.stageLabel) return job.stageLabel;
+      if (job?.state === 'transcript-only') return 'Transcript is ready. Summary and cleanup are still running.';
+      return fallbackStage || job?.stage || 'Waiting for background processing.';
+    }
+
+    function processingStatusTitle(status, mode) {
+      const job = primaryProcessingJob(status);
+      switch (job?.state) {
+        case 'transcribing':
+          return mode === 'quick-thought' ? 'Transcribing quick thought' : 'Transcribing recording';
+        case 'transcript-only':
+          return 'Transcript ready, summarizing';
+        case 'diarizing':
+          return 'Separating speakers';
+        case 'summarizing':
+          return mode === 'quick-thought' ? 'Generating memo summary' : 'Generating meeting summary';
+        case 'saving':
+          return mode === 'quick-thought' ? 'Saving quick thought' : 'Saving recording';
+        default:
+          return status.processingTitle
+            ? `Processing ${status.processingTitle}`
+            : currentProcessingTitle(mode);
+      }
+    }
+
     function renderProcessingJobs(jobs) {
       processingJobs = Array.isArray(jobs) ? jobs : [];
       processingJobsEl.replaceChildren();
@@ -6079,11 +6110,7 @@
 
         const detail = document.createElement('div');
         detail.className = 'processing-job-detail';
-        detail.textContent =
-          job.stage
-          || (job.state === 'transcript-only'
-            ? 'Transcript is ready. The richer summary is still running.'
-            : 'Waiting for background processing.');
+        detail.textContent = processingStageText(job);
 
         const meta = document.createElement('div');
         meta.className = 'processing-job-meta';
@@ -6191,14 +6218,13 @@
           const detail = document.createElement('div');
           detail.className = 'recovery-item-detail';
           detail.textContent = job.error
-            || job.stage
             || (job.state === 'complete'
               ? 'Finished processing.'
               : job.state === 'needs-review'
                 ? 'Transcript needs review. Raw capture was preserved for retry.'
                 : job.state === 'transcript-only'
                   ? 'Transcript is ready while enrichment continues.'
-                  : 'Queued for background processing.');
+                  : processingStageText(job, 'Queued for background processing.'));
 
           const path = document.createElement('div');
           path.className = 'recovery-item-path';
@@ -6365,17 +6391,19 @@
           stopRequested = false;
           document.getElementById('btn-stop').disabled = false;
           statusPill.className = 'status-pill processing';
-          statusPill.textContent = 'processing';
-          processingTitle.textContent = status.processingTitle
-            ? `Processing ${status.processingTitle}`
-            : currentProcessingTitle(mode);
+          const job = primaryProcessingJob(status);
+          statusPill.textContent = job ? processingStateLabel(job).toLowerCase() : 'processing';
+          processingTitle.textContent = processingStatusTitle(status, mode);
           recordingBar.classList.remove('active');
           processingBar.classList.add('active');
           liveBar.classList.remove('active'); // T4
           isLiveTranscript = false;
           callBanner.classList.remove('active');
           setFooterCaptureMode(false);
-          processingStage.textContent = status.processingStage || 'Preparing transcript...';
+          processingStage.textContent =
+            status.processingStageLabel
+            || (job ? processingStageText(job, status.processingStage) : status.processingStage)
+            || 'Preparing transcript...';
 
           // Start elapsed timer when processing begins
           if (!wasProcessing) {

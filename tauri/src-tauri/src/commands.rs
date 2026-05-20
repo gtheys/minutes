@@ -1908,6 +1908,7 @@ pub struct ProcessingJobView {
     pub mode: String,
     pub state: String,
     pub stage: Option<String>,
+    pub stage_label: Option<String>,
     pub output_path: Option<String>,
     pub audio_path: String,
     pub error: Option<String>,
@@ -2004,11 +2005,13 @@ fn processing_job_title_fallback(mode: CaptureMode) -> &'static str {
 }
 
 fn processing_job_view(job: minutes_core::jobs::ProcessingJob) -> ProcessingJobView {
-    let fallback_title = processing_job_title_fallback(job.mode);
+    let mode = job.mode;
+    let fallback_title = processing_job_title_fallback(mode);
+    let stage_label = pipeline_stage_label(job.stage.as_deref(), Some(mode)).map(String::from);
     ProcessingJobView {
         id: job.id,
         title: job.title.unwrap_or_else(|| fallback_title.into()),
-        mode: match job.mode {
+        mode: match mode {
             CaptureMode::Meeting => "meeting".into(),
             CaptureMode::QuickThought => "quick-thought".into(),
             CaptureMode::Dictation => "dictation".into(),
@@ -2026,6 +2029,7 @@ fn processing_job_view(job: minutes_core::jobs::ProcessingJob) -> ProcessingJobV
             minutes_core::jobs::JobState::Failed => "failed".into(),
         },
         stage: job.stage,
+        stage_label,
         output_path: job.output_path,
         audio_path: job.audio_path,
         error: job.error,
@@ -9690,6 +9694,45 @@ mod tests {
                 CaptureMode::Meeting
             ),
             "Saving meeting"
+        );
+    }
+
+    #[test]
+    fn processing_job_view_includes_user_facing_stage_label() {
+        let job = minutes_core::jobs::ProcessingJob {
+            id: "job-summary".into(),
+            title: Some("Design review".into()),
+            mode: CaptureMode::Meeting,
+            content_type: ContentType::Meeting,
+            state: minutes_core::jobs::JobState::Summarizing,
+            stage: Some("summarizing".into()),
+            output_path: Some("/tmp/design-review.md".into()),
+            audio_path: "/tmp/design-review.wav".into(),
+            error: None,
+            created_at: chrono::Local::now(),
+            started_at: Some(chrono::Local::now()),
+            finished_at: None,
+            notice_dismissed_at: None,
+            recording_started_at: None,
+            recording_finished_at: None,
+            context_session_id: None,
+            user_notes: None,
+            pre_context: None,
+            calendar_event: None,
+            template_slug: None,
+            word_count: None,
+            owner_pid: None,
+            retry_count: 0,
+            recording_health: None,
+        };
+
+        let view = processing_job_view(job);
+
+        assert_eq!(view.state, "summarizing");
+        assert_eq!(view.stage.as_deref(), Some("summarizing"));
+        assert_eq!(
+            view.stage_label.as_deref(),
+            Some("Generating meeting summary")
         );
     }
 
