@@ -45,6 +45,7 @@ pub struct AppState {
     pub dictation_stop_flag: Arc<AtomicBool>,
     pub dictation_focus_guard: Arc<Mutex<Option<DictationFocusGuard>>>,
     pub pending_dictation_target: Arc<Mutex<Option<PendingDictationTarget>>>,
+    pub dictation_release_started_at: Arc<Mutex<Option<Instant>>>,
     pub dictation_shortcut_enabled: Arc<AtomicBool>,
     pub dictation_shortcut: Arc<Mutex<String>>,
     pub live_transcript_active: Arc<AtomicBool>,
@@ -6109,6 +6110,9 @@ pub fn handle_dictation_shortcut_event(
             }
         }))
         .ok();
+        if let Ok(mut released_at) = state.dictation_release_started_at.lock() {
+            *released_at = Some(Instant::now());
+        }
         state.dictation_stop_flag.store(true, Ordering::Relaxed);
         return;
     }
@@ -9303,6 +9307,7 @@ mod tests {
             dictation_stop_flag: Arc::new(AtomicBool::new(false)),
             dictation_focus_guard: Arc::new(Mutex::new(None)),
             pending_dictation_target: Arc::new(Mutex::new(None)),
+            dictation_release_started_at: Arc::new(Mutex::new(None)),
             dictation_shortcut_enabled: Arc::new(AtomicBool::new(false)),
             dictation_shortcut: Arc::new(Mutex::new("CmdOrCtrl+Shift+Space".into())),
             live_transcript_active: Arc::new(AtomicBool::new(false)),
@@ -12949,6 +12954,7 @@ pub fn cmd_copy_dictation(
             mode: crate::text_insertion::TextInsertionMode::CopyOnly,
             restore_clipboard: false,
             clipboard_snapshot: None,
+            expected_target: None,
         },
     ))
 }
@@ -12972,6 +12978,7 @@ pub fn cmd_repaste_dictation(
             mode: crate::text_insertion::TextInsertionMode::BestEffortVerified,
             restore_clipboard: config.dictation.auto_paste_restore,
             clipboard_snapshot,
+            expected_target: None,
         },
     ))
 }
@@ -12979,6 +12986,9 @@ pub fn cmd_repaste_dictation(
 #[tauri::command]
 pub fn cmd_stop_dictation(state: tauri::State<AppState>) -> Result<String, String> {
     if state.dictation_active.load(Ordering::Relaxed) {
+        if let Ok(mut released_at) = state.dictation_release_started_at.lock() {
+            *released_at = Some(Instant::now());
+        }
         state.dictation_stop_flag.store(true, Ordering::Relaxed);
         return Ok("Dictation stop requested".into());
     }
@@ -12998,10 +13008,9 @@ fn show_dictation_overlay(app: &tauri::AppHandle) {
         win.destroy().ok();
     }
 
-    // Position: bottom-right HUD, anchored to the current monitor work area.
+    // Position: bottom-center HUD, anchored to the current monitor work area.
     let width = 320.0;
     let height = 88.0;
-    let inset_x = 16.0;
     let inset_y = 16.0;
 
     let monitor = app
@@ -13020,11 +13029,11 @@ fn show_dictation_overlay(app: &tauri::AppHandle) {
         let work_width = work_area.size.width as f64 / scale;
         let work_height = work_area.size.height as f64 / scale;
         (
-            work_x + work_width - width - inset_x,
+            work_x + (work_width - width) / 2.0,
             work_y + work_height - height - inset_y,
         )
     } else {
-        (1440.0 - width - inset_x, 900.0 - height - inset_y)
+        ((1440.0 - width) / 2.0, 900.0 - height - inset_y)
     };
 
     match tauri::WebviewWindowBuilder::new(
@@ -13845,6 +13854,60 @@ fn record_dictation_memory(
     }
 }
 
+fn dictation_should_insert(config: &Config) -> bool {
+    match config.dictation.destination.as_str() {
+        "insert" => true,
+        "" | "clipboard" => false,
+        _ => config.dictation.auto_paste,
+    }
+}
+
+fn dictation_insert_fallback_message(config: &Config) -> Option<&'static str> {
+    if dictation_should_insert(config) && !crate::text_insertion::can_insert_into_apps() {
+        Some(crate::text_insertion::insertion_permission_fallback_message())
+    } else {
+        None
+    }
+}
+
+fn take_dictation_release_started_at(state: &AppState) -> Option<Instant> {
+    state
+        .dictation_release_started_at
+        .lock()
+        .ok()
+        .and_then(|mut released_at| released_at.take())
+}
+
+fn log_dictation_insert(
+    result: &minutes_core::dictation::DictationResult,
+    insertion: &crate::text_insertion::TextInsertionResult,
+    release_started_at: Option<Instant>,
+    insert_started_at: Instant,
+) {
+    let release_to_inserted_ms = release_started_at.map(|started| started.elapsed().as_millis());
+    let duration_ms =
+        release_to_inserted_ms.unwrap_or_else(|| insert_started_at.elapsed().as_millis());
+    let file_label = result
+        .file_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    minutes_core::logging::log_step(
+        "dictation_insert",
+        &file_label,
+        duration_ms as u64,
+        serde_json::json!({
+            "release_to_inserted_ms": release_to_inserted_ms,
+            "insert_operation_ms": insert_started_at.elapsed().as_millis(),
+            "destination": result.destination,
+            "outcome": insertion.outcome.as_str(),
+            "method": insertion.method.as_str(),
+            "verified": insertion.verified,
+            "clipboard_restored": insertion.clipboard_restored,
+        }),
+    );
+}
+
 fn restore_dictation_target_focus(
     target_context: &Option<crate::text_insertion::ActiveTargetContext>,
 ) {
@@ -14044,6 +14107,9 @@ fn start_dictation_session(
     app.emit("dictation:state", "loading").ok();
 
     state.dictation_stop_flag.store(false, Ordering::Relaxed);
+    if let Ok(mut released_at) = state.dictation_release_started_at.lock() {
+        *released_at = None;
+    }
     // dictation_active is already true from try_acquire_dictation; sync the
     // tray so the menu reflects the just-started session.
     crate::sync_tray_state(app);
@@ -14064,12 +14130,10 @@ fn start_dictation_session(
         // disconnects (#189). In-memory only; startup-side persistence
         // is in main.rs.
         minutes_core::capture::auto_heal_missing_recording_device(&mut config);
-        let clipboard_snapshot =
-            if config.dictation.auto_paste && config.dictation.auto_paste_restore {
-                crate::text_insertion::read_clipboard().ok()
-            } else {
-                None
-            };
+        let insert_available_at_start = dictation_insert_fallback_message(&config).is_none();
+        let insert_fallback_message_for_events =
+            dictation_insert_fallback_message(&config).map(str::to_string);
+        let insert_fallback_emitted = Arc::new(AtomicBool::new(false));
         let app_for_events = app_clone.clone();
         let app_for_results = app_clone.clone();
         let config_for_results = config.clone();
@@ -14086,6 +14150,7 @@ fn start_dictation_session(
                     DictationEvent::Accumulating => "accumulating",
                     DictationEvent::Processing => "processing",
                     DictationEvent::PartialText(_) => "partial",
+                    DictationEvent::AudioLevel(_) => "",
                     DictationEvent::SilenceCountdown { .. } => "",
                     DictationEvent::Success => "success",
                     DictationEvent::Error => "error",
@@ -14093,11 +14158,30 @@ fn start_dictation_session(
                     DictationEvent::Yielded => "yielded",
                 };
                 if !state_str.is_empty() {
+                    if matches!(&event, DictationEvent::Listening) {
+                        if let Some(message) = insert_fallback_message_for_events.as_ref() {
+                            if !insert_fallback_emitted.swap(true, Ordering::Relaxed) {
+                                app_for_events
+                                    .emit(
+                                        "dictation:insertion",
+                                        serde_json::json!({
+                                            "message": message,
+                                            "earlyFallback": true,
+                                        }),
+                                    )
+                                    .ok();
+                            }
+                        }
+                    }
                     app_for_events.emit("dictation:state", state_str).ok();
                 }
 
                 if let DictationEvent::PartialText(text) = &event {
                     app_for_events.emit("dictation:partial", text.as_str()).ok();
+                }
+
+                if let DictationEvent::AudioLevel(level) = &event {
+                    app_for_events.emit("dictation:level", level).ok();
                 }
 
                 if let DictationEvent::SilenceCountdown {
@@ -14115,19 +14199,15 @@ fn start_dictation_session(
                         )
                         .ok();
                 }
-
-                if matches!(
-                    &event,
-                    DictationEvent::Accumulating | DictationEvent::PartialText(_)
-                ) {
-                    let level = minutes_core::streaming::stream_audio_level();
-                    app_for_events.emit("dictation:level", level).ok();
-                }
             },
             move |result| {
                 final_output_for_results.store(true, Ordering::Relaxed);
                 app_for_results.emit("dictation:result", &result.text).ok();
-                if config_for_results.dictation.auto_paste {
+                let insert_started_at = Instant::now();
+                let release_started_at = app_for_results
+                    .try_state::<AppState>()
+                    .and_then(|state| take_dictation_release_started_at(&state));
+                if dictation_should_insert(&config_for_results) && insert_available_at_start {
                     app_for_results.emit("dictation:state", "inserting").ok();
                     dictation_focus_debug(
                         "before_insert_restore",
@@ -14141,13 +14221,20 @@ fn start_dictation_session(
                             text: result.text.clone(),
                             mode: crate::text_insertion::TextInsertionMode::BestEffortVerified,
                             restore_clipboard: config_for_results.dictation.auto_paste_restore,
-                            clipboard_snapshot: clipboard_snapshot.clone(),
+                            clipboard_snapshot: None,
+                            expected_target: dictation_target_context_for_results.clone(),
                         },
                     );
                     app_for_results.emit("dictation:insertion", &insertion).ok();
                     app_for_results
                         .emit("dictation:state", insertion.overlay_state())
                         .ok();
+                    log_dictation_insert(
+                        &result,
+                        &insertion,
+                        release_started_at,
+                        insert_started_at,
+                    );
                     record_dictation_memory(&config_for_results, &result, &insertion);
                 } else {
                     dictation_focus_debug(
@@ -14163,12 +14250,19 @@ fn start_dictation_session(
                             mode: crate::text_insertion::TextInsertionMode::CopyOnly,
                             restore_clipboard: false,
                             clipboard_snapshot: None,
+                            expected_target: None,
                         },
                     );
                     app_for_results.emit("dictation:insertion", &insertion).ok();
                     app_for_results
                         .emit("dictation:state", insertion.overlay_state())
                         .ok();
+                    log_dictation_insert(
+                        &result,
+                        &insertion,
+                        release_started_at,
+                        insert_started_at,
+                    );
                     record_dictation_memory(&config_for_results, &result, &insertion);
                 }
             },
