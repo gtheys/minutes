@@ -1384,15 +1384,27 @@ fn spawn_meetings_refresh_watcher(app: &tauri::AppHandle, output_dir: std::path:
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             };
 
-            match event {
-                Ok(event) if should_refresh_meetings_for_paths(&event.paths) => {
-                    let _ = app_handle.emit("artifacts:changed", ());
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    eprintln!("[meetings-watcher] watch error: {}", error);
-                }
+            let hit = matches!(&event, Ok(event) if should_refresh_meetings_for_paths(&event.paths));
+            if let Err(error) = &event {
+                eprintln!("[meetings-watcher] watch error: {}", error);
             }
+            if !hit {
+                continue;
+            }
+
+            // Coalesce a burst of raw fs events into a single emit. On Linux,
+            // inotify delivers one event per syscall (write/chmod/rename/
+            // close-write) instead of the batched events FSEvents gives us on
+            // macOS, so a single logical save can fire this arm many times in
+            // a row. Each emit drives a full list rebuild in the UI, so
+            // without this drain the list visibly flashes once per raw event
+            // instead of once per save.
+            while let Ok(Ok(_event)) =
+                rx.recv_timeout(std::time::Duration::from_millis(250))
+            {
+                // drained, ignored
+            }
+            let _ = app_handle.emit("artifacts:changed", ());
         }
     });
 }
