@@ -1320,6 +1320,22 @@ fn should_refresh_meetings_for_paths(paths: &[std::path::PathBuf]) -> bool {
     })
 }
 
+/// Reads/atime-only touches never change what the meetings list shows, but
+/// desktop search indexers (Tracker on GNOME, Baloo on KDE) commonly `stat`
+/// or touch atime on files under a watched, recursive home-dir tree like
+/// `~/meetings`. On Linux those show up as their own inotify events
+/// (`Access`, `Modify(Metadata(AccessTime))`) distinct from a real write, so
+/// filter them out here instead of treating every touch as a reason to
+/// rebuild the list.
+fn is_content_change(kind: &notify::EventKind) -> bool {
+    use notify::event::ModifyKind;
+    !matches!(
+        kind,
+        notify::EventKind::Access(_)
+            | notify::EventKind::Modify(ModifyKind::Metadata(_))
+    )
+}
+
 fn bind_meetings_refresh_watcher(
     watcher: &mut RecommendedWatcher,
     output_dir: &std::path::Path,
@@ -1384,7 +1400,10 @@ fn spawn_meetings_refresh_watcher(app: &tauri::AppHandle, output_dir: std::path:
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             };
 
-            let hit = matches!(&event, Ok(event) if should_refresh_meetings_for_paths(&event.paths));
+            let hit = matches!(
+                &event,
+                Ok(event) if is_content_change(&event.kind) && should_refresh_meetings_for_paths(&event.paths)
+            );
             if let Err(error) = &event {
                 eprintln!("[meetings-watcher] watch error: {}", error);
             }
